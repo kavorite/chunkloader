@@ -195,11 +195,14 @@ impl AudioReader {
         let array = Python::allow_threads(
             slf.py(),
             move || -> Result<Option<ndarray::Array2<f32>>, PyErr> {
+                // Get all locks once at the start
                 let mut buffer = buffer.lock().unwrap();
+                let mut input = input.lock().unwrap();
+                let mut decoder = decoder.lock().unwrap();
+                let mut resampler = resampler.lock().unwrap();
 
                 // Keep reading packets until we have enough samples or reach EOF
                 while buffer.len() < chunk_size * channels {
-                    let mut input = input.lock().unwrap();
                     match input.packets().next() {
                         Some((stream, packet)) => {
                             if stream.index() != stream_index {
@@ -207,7 +210,6 @@ impl AudioReader {
                             }
 
                             let mut frame = Audio::empty();
-                            let mut decoder = decoder.lock().unwrap();
                             decoder
                                 .send_packet(&packet)
                                 .map_err(|e| AudioError::PacketSend(e.to_string()))?;
@@ -215,7 +217,6 @@ impl AudioReader {
                             match decoder.receive_frame(&mut frame) {
                                 Ok(_) => {
                                     let mut output_frame = Audio::empty();
-                                    let mut resampler = resampler.lock().unwrap();
                                     resampler
                                         .run(&frame, &mut output_frame)
                                         .map_err(|e| AudioError::ResampleError(e.to_string()))?;
