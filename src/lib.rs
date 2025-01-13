@@ -12,6 +12,34 @@ use rubato::{Resampler, SincFixedIn, WindowFunction};
 use rubato::SincInterpolationParameters;
 use std::sync::Mutex;
 use std::sync::Arc;
+use numpy::{PyArray2, IntoPyArray};
+use ndarray;
+use thiserror::Error;
+use pyo3::BoundObject;
+
+#[derive(Error, Debug)]
+pub enum AudioError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Failed to probe media format: {0}")]
+    ProbeError(String),
+    #[error("Failed to create decoder: {0}")]
+    DecoderError(String),
+    #[error("Failed to decode packet: {0}")]
+    DecodeError(String),
+    #[error("Failed to resample: {0}")]
+    ResampleError(String),
+    #[error("No default track found")]
+    NoDefaultTrack,
+    #[error("File must be stereo (has {0} channels)")]
+    NotStereo(usize),
+}
+
+impl From<AudioError> for PyErr {
+    fn from(err: AudioError) -> PyErr {
+        PyValueError::new_err(err.to_string())
+    }
+}
 
 #[pyclass]
 struct AudioReader {
@@ -34,7 +62,7 @@ struct TempReader {
 }
 
 impl TempReader {
-    fn decode_next_packet(&self) -> PyResult<Option<Vec<f32>>> {
+    fn decode_next_packet(&self) -> Result<Option<Vec<f32>>, AudioError> {
         let mut format_guard = self.format.lock().unwrap();
         let mut decoder_guard = self.decoder.lock().unwrap();
         
@@ -47,13 +75,23 @@ impl TempReader {
             Err(symphonia::core::errors::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(None);
             }
-            Err(e) => return Err(PyValueError::new_err(format!("Error reading packet: {}", e))),
+            Err(e) => return Err(AudioError::DecodeError(e.to_string())),
         };
 
-        // Decode packet
-        let decoded = decoder.decode(&packet).map_err(|e| {
-            PyValueError::new_err(format!("Failed to decode packet: {}", e))
-        })?;
+        // Decode packet with better error handling
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(symphonia::core::errors::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(None);
+            }
+            Err(e) => {
+                // If we hit an unexpected end of bitstream, treat it as end of file
+                if e.to_string().contains("unexpected end of bitstream") {
+                    return Ok(None);
+                }
+                return Err(AudioError::DecodeError(e.to_string()));
+            }
+        };
 
         // Convert to f32 samples
         let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
@@ -71,7 +109,7 @@ impl TempReader {
                 .collect();
 
             let resampled = resampler.process(&chunks.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), None)
-                .map_err(|e| PyValueError::new_err(format!("Failed to resample: {}", e)))?;
+                .map_err(|e| AudioError::ResampleError(e.to_string()))?;
 
             // Flatten channels back to interleaved format
             let mut result = Vec::new();
@@ -86,27 +124,10 @@ impl TempReader {
         }
     }
 
-    fn decode_until_size(&self, target_size: usize) -> PyResult<Option<Vec<f32>>> {
-        let mut accumulated = Vec::with_capacity(target_size);
-        
-        while accumulated.len() < target_size {
-            match self.decode_next_packet()? {
-                Some(samples) => {
-                    accumulated.extend(samples);
-                },
-                None => {
-                    if accumulated.is_empty() {
-                        return Ok(None);
-                    }
-                    break;
-                }
-            }
-        }
-
-        if accumulated.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(accumulated))
+    fn decode_until_size(&self, target_size: usize) -> Result<Option<Vec<f32>>, AudioError> {
+        match self.decode_next_packet()? {
+            Some(interleaved) => Ok(Some(interleaved)),
+            None => Ok(None),
         }
     }
 }
@@ -144,73 +165,38 @@ impl AudioReader {
         self.target_sample_rate
     }
 
-    fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<(Vec<f32>, Vec<f32>)>> {
+    fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Bound<'_, PyArray2<f32>>>> {
         let this = slf.borrow();
         
-        // Initialize if needed (keep GIL)
-        if this.decoder.lock().unwrap().is_none() {
-            this.initialize()?;
-        }
-
-        // Get channels value before creating TempReader
-        let channels = *this.channels.lock().unwrap();
-
-        // Create TempReader with Arc clones
-        let temp_reader = TempReader {
-            decoder: Arc::clone(&this.decoder),
-            format: Arc::clone(&this.format),
-            resampler: Arc::clone(&this.resampler),
-            channels,
-        };
-
-        // Release GIL for heavy processing
-        let chunk = Python::with_gil(|py| {
-            py.allow_threads(|| {
-                temp_reader.decode_until_size(1 << 20)
-            })
-        })?;
-
-        match chunk {
-            Some(interleaved) => {
-                let mut left = Vec::with_capacity(interleaved.len() / 2);
-                let mut right = Vec::with_capacity(interleaved.len() / 2);
-                
-                for chunk in interleaved.chunks_exact(2) {
-                    left.push(chunk[0]);
-                    right.push(chunk[1]);
-                }
-                
-                Ok(Some((left, right)))
+        match this.get_next_chunk(1 << 20)? {
+            Some((channels, data)) => {
+                let array = ndarray::Array2::from_shape_vec((channels, data.len() / channels), data)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                // Create the pyarray and bind it to a variable first
+                Ok(Some(array.into_pyarray(this.py()).into_bound()))
             },
             None => Ok(None),
         }
     }
 
-    fn get_next_chunk(slf: Bound<'_, Self>, chunk_size: usize) -> PyResult<Option<Vec<f32>>> {
-        let this = slf.borrow();
-        
-        // Initialize if needed (keep GIL)
-        if this.decoder.lock().unwrap().is_none() {
-            this.initialize()?;
+    fn get_next_chunk(&self, chunk_size: usize) -> Result<Option<(usize, Vec<f32>)>, AudioError> {
+        if self.decoder.lock().unwrap().is_none() {
+            self.initialize().map_err(|e| AudioError::DecoderError(e.to_string()))?;
         }
 
-        // Get channels value before creating TempReader
-        let channels = *this.channels.lock().unwrap();
-
-        // Create TempReader with Arc clones
+        let channels = *self.channels.lock().unwrap();
         let temp_reader = TempReader {
-            decoder: Arc::clone(&this.decoder),
-            format: Arc::clone(&this.format),
-            resampler: Arc::clone(&this.resampler),
+            decoder: Arc::clone(&self.decoder),
+            format: Arc::clone(&self.format),
+            resampler: Arc::clone(&self.resampler),
             channels,
         };
 
-        // Release GIL for heavy processing
-        Python::with_gil(|py| {
-            py.allow_threads(|| {
-                temp_reader.decode_until_size(chunk_size)
-            })
-        })
+        // Return raw data and channel count
+        match temp_reader.decode_until_size(chunk_size)? {
+            Some(array) => Ok(Some((channels, array.to_vec()))),
+            None => Ok(None),
+        }
     }
 }
 
@@ -223,15 +209,22 @@ impl AudioReader {
 
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-        // Create format reader
+        // Create format reader with explicit hint for M4A
         let mut hint = Hint::new();
         if let Some(ext) = Path::new(&self.file_path).extension() {
-            hint.with_extension(ext.to_str().unwrap_or(""));
+            let ext_str = ext.to_str().unwrap_or("");
+            hint.with_extension(ext_str);
+            
+            // Add explicit MIME type for M4A
+            if ext_str.eq_ignore_ascii_case("m4a") {
+                hint.mime_type("audio/mp4");
+            }
         }
 
         let probed = symphonia::default::get_probe()
             .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
             .map_err(|e| PyValueError::new_err(format!("Failed to probe media format: {}", e)))?;
+
 
         let format = probed.format;
         let track = format.default_track().ok_or_else(|| {
@@ -361,7 +354,7 @@ impl AudioReader {
 }
 
 #[pymodule]
-fn audio_reader(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn chunkloader(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AudioReader>()?;
     Ok(())
 }
