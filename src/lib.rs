@@ -73,7 +73,7 @@ impl AudioReader {
             .map_err(|e| PyValueError::new_err(format!("Failed to initialize FFmpeg: {}", e)))?;
 
         unsafe {
-            // ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_TRACE as i32);
+            ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_QUIET as i32);
         }
 
         let input =
@@ -111,22 +111,6 @@ impl AudioReader {
 
         // Always create a context, either for resampling or for format conversion
         let target_rate = target_sample_rate.unwrap_or(source_sample_rate);
-        println!(
-            "Creating resampler:\n\
-             - Input format: {:?}\n\
-             - Input layout: {:?}\n\
-             - Input rate: {}\n\
-             - Output format: {:?}\n\
-             - Output layout: {:?}\n\
-             - Output rate: {}",
-            decoder.format(),
-            decoder.channel_layout(),
-            source_sample_rate,
-            decoder.format(),
-            decoder.channel_layout(),
-            target_rate,
-        );
-
         let resampler = Context::get(
             decoder.format(),
             decoder.channel_layout(),
@@ -175,7 +159,7 @@ impl AudioReader {
     }
 
     fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Bound<'_, PyArray2<f32>>>> {
-        let mut this = slf.borrow_mut();
+        let this = slf.borrow_mut();
         let py = slf.py();
 
         let mut buffer = this.buffer.lock().unwrap();
@@ -215,23 +199,6 @@ impl AudioReader {
                             continue;
                         }
                         Err(e) => {
-                            println!(
-                                "Warning: Resampler failed, attempting reset:\n\
-                                 - samples: {}\n\
-                                 - channels: {}\n\
-                                 - format: {:?}\n\
-                                 - rate: {}\n\
-                                 - pts: {:?}\n\
-                                 Error: {}",
-                                frame.samples(),
-                                frame.channels(),
-                                frame.format(),
-                                frame.rate(),
-                                frame.pts(),
-                                e
-                            );
-
-                            // Create new resampler
                             let new_resampler = Context::get(
                                 decoder.format(),
                                 decoder.channel_layout(),
@@ -242,13 +209,10 @@ impl AudioReader {
                             )
                             .map_err(|e| AudioError::ResamplerCreation(e.to_string()))?;
 
-                            // Replace the old resampler
                             *resampler = new_resampler;
 
-                            // Try again with the new resampler
                             match resampler.run(&frame, &mut output_frame) {
                                 Ok(_) => {
-                                    // Handle successful resampling after reset
                                     if output_frame.is_planar() {
                                         let samples_per_channel = output_frame.samples();
                                         for i in 0..samples_per_channel {
@@ -260,12 +224,7 @@ impl AudioReader {
                                         buffer.extend_from_slice(output_frame.plane::<f32>(0));
                                     }
                                 }
-                                Err(e) => {
-                                    println!(
-                                        "Warning: Frame still failed after resampler reset: {}",
-                                        e
-                                    );
-                                }
+                                Err(e) => {}
                             }
                             continue;
                         }
