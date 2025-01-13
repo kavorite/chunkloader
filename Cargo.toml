@@ -9,9 +9,8 @@ name = "chunkloader"
 crate-type = ["cdylib"]
 
 [dependencies]
+ffmpeg-next = "7.1"
 ndarray = "0.16.1"
 numpy = "0.23.0"
 pyo3 = "0.23.3"
-rubato = "0.16.1"
-symphonia = {version = "0.5.4", features=["aac", "mpa"]}
 thiserror = "2.0.11"
