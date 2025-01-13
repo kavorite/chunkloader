@@ -1,124 +1,48 @@
+use std::sync::{Arc, Mutex};
+
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::format::context::input;
-use ffmpeg_next::format::input;
+use ffmpeg_next::format::Sample;
 use ffmpeg_next::media::Type;
-use ffmpeg_next::software::resampler;
 use ffmpeg_next::software::resampling::context::Context;
 use ffmpeg_next::util::frame::audio::Audio;
 use ndarray;
 use numpy::{IntoPyArray, PyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::BoundObject;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
-use thiserror::Error;
 
-#[derive(Error, Debug)]
-pub enum AudioError {
-    #[error("FFmpeg system initialization failed: {0}")]
-    SystemInit(String),
-
-    #[error("FFmpeg configuration error: {0}")]
-    Config(String),
-
-    #[error("Failed to initialize FFmpeg: {0}")]
-    FFmpegInit(String),
-
-    #[error("Failed to open audio file: {0}")]
-    FileOpen(String),
-
-    #[error("Failed to create decoder: {0}")]
-    DecoderCreation(String),
-
-    #[error("Failed to send packet to decoder: {0}")]
+#[derive(Debug)]
+enum AudioError {
     PacketSend(String),
-
-    #[error("Failed to receive frame from decoder: {0}")]
-    FrameReceive(String),
-
-    #[error("Failed to create resampler: {0}")]
-    ResamplerCreation(String),
-
-    #[error("Failed to resample audio: {0}")]
     ResampleError(String),
-
-    #[error("Not a stereo audio file (got {0} channels)")]
-    NotStereo(usize),
-
-    #[error("Audio stream not initialized")]
-    NotInitialized,
-
-    #[error("No audio stream found in file")]
+    FrameReceive(String),
+    FileOpen(String),
     NoAudioStream,
-
-    #[error("Internal state error: {0}")]
-    InternalState(String),
+    DecoderCreation(String),
+    NotStereo(usize),
+    ResamplerCreation(String),
 }
 
-impl From<ffmpeg_next::Error> for AudioError {
-    fn from(err: ffmpeg_next::Error) -> Self {
-        match err {
-            ffmpeg_next::Error::Bug => {
-                AudioError::InternalState(format!("Internal FFmpeg error: {}", err))
-            }
-            ffmpeg_next::Error::Bug2 => {
-                AudioError::InternalState(format!("Internal FFmpeg error 2: {}", err))
-            }
-            ffmpeg_next::Error::Exit => {
-                AudioError::InternalState(format!("FFmpeg process exit: {}", err))
-            }
-            ffmpeg_next::Error::External => {
-                AudioError::InternalState(format!("External FFmpeg error: {}", err))
-            }
-            ffmpeg_next::Error::InvalidData => {
-                AudioError::Config(format!("Invalid FFmpeg configuration or data: {}", err))
-            }
-            ffmpeg_next::Error::PatchWelcome => {
-                AudioError::InternalState(format!("FFmpeg patch welcome: {}", err))
-            }
-            ffmpeg_next::Error::DecoderNotFound => {
-                AudioError::DecoderCreation(format!("Required decoder not found: {}", err))
-            }
-            ffmpeg_next::Error::EncoderNotFound => {
-                AudioError::Config(format!("Required encoder not found: {}", err))
-            }
-            ffmpeg_next::Error::StreamNotFound => AudioError::NoAudioStream,
-            ffmpeg_next::Error::Unknown => {
-                AudioError::InternalState(format!("Unknown FFmpeg error: {}", err))
-            }
-            ffmpeg_next::Error::BufferTooSmall => {
-                AudioError::Config(format!("Buffer too small: {}", err))
-            }
-            ffmpeg_next::Error::Experimental => {
-                AudioError::Config(format!("Experimental feature: {}", err))
-            }
-            ffmpeg_next::Error::InputChanged => {
-                AudioError::Config(format!("Input format changed: {}", err))
-            }
-            ffmpeg_next::Error::OutputChanged => {
-                AudioError::Config(format!("Output format changed: {}", err))
-            }
-            ffmpeg_next::Error::FilterNotFound => {
-                AudioError::Config(format!("Required filter not found: {}", err))
-            }
-            ffmpeg_next::Error::OptionNotFound => {
-                AudioError::Config(format!("Required option not found: {}", err))
-            }
-            ffmpeg_next::Error::Eof => AudioError::InternalState("End of file reached".to_string()),
-            ffmpeg_next::Error::BsfNotFound => {
-                AudioError::Config(format!("Bitstream filter not found: {}", err))
-            }
-            // Add any other variants that might be missing
-            _ => AudioError::InternalState(format!("Unhandled FFmpeg error: {}", err)),
+impl std::error::Error for AudioError {}
+
+impl std::fmt::Display for AudioError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            AudioError::PacketSend(msg) => write!(f, "Failed to send packet: {}", msg),
+            AudioError::ResampleError(msg) => write!(f, "Failed to resample: {}", msg),
+            AudioError::FrameReceive(msg) => write!(f, "Failed to receive frame: {}", msg),
+            AudioError::FileOpen(msg) => write!(f, "Failed to open file: {}", msg),
+            AudioError::NoAudioStream => write!(f, "No audio stream found"),
+            AudioError::DecoderCreation(msg) => write!(f, "Failed to get decoder: {}", msg),
+            AudioError::NotStereo(channels) => write!(f, "Expected 2 channels, found {}", channels),
+            AudioError::ResamplerCreation(msg) => write!(f, "Failed to create resampler: {}", msg),
         }
     }
 }
 
 impl From<AudioError> for PyErr {
     fn from(err: AudioError) -> PyErr {
-        PyValueError::new_err(format!("{}", err))
+        PyValueError::new_err(err.to_string())
     }
 }
 
@@ -131,15 +55,25 @@ struct AudioReader {
     channels: usize,
     buffer: Arc<Mutex<Vec<f32>>>,
     chunk_size: usize,
+    source_sample_rate: u32,
+    target_sample_rate: Option<u32>,
+    total_samples: usize,
 }
 
 #[pymethods]
 impl AudioReader {
     #[new]
-    fn new(file_path: String, target_sample_rate: u32, chunk_size: usize) -> PyResult<Self> {
-        ffmpeg::init().map_err(|e| AudioError::FFmpegInit(e.to_string()))?;
+    #[pyo3(signature = (file_path, target_sample_rate=None, chunk_size=1024))]
+    fn new(
+        file_path: String,
+        target_sample_rate: Option<u32>,
+        chunk_size: usize,
+    ) -> PyResult<Self> {
+        ffmpeg::init()
+            .map_err(|e| PyValueError::new_err(format!("Failed to initialize FFmpeg: {}", e)))?;
 
-        let input = input(&file_path).map_err(|e| AudioError::FileOpen(e.to_string()))?;
+        let input =
+            ffmpeg::format::input(&file_path).map_err(|e| AudioError::FileOpen(e.to_string()))?;
 
         let audio_stream = input
             .streams()
@@ -152,19 +86,36 @@ impl AudioReader {
             .decoder()
             .audio()
             .map_err(|e| AudioError::DecoderCreation(e.to_string()))?;
+
+        let source_sample_rate = decoder.rate() as u32;
         let channels = decoder.channels() as usize;
+        let channel_layout = decoder.channel_layout();
 
         if channels != 2 {
             return Err(AudioError::NotStereo(channels).into());
         }
 
-        let resampler = decoder
-            .resampler(
-                ffmpeg::util::format::Sample::F32(ffmpeg::util::format::sample::Type::Planar),
-                ffmpeg::util::channel_layout::ChannelLayout::STEREO,
-                target_sample_rate,
-            )
-            .map_err(|e| AudioError::ResamplerCreation(e.to_string()))?;
+        // Calculate total duration if available
+        let total_samples = {
+            let duration = audio_stream.duration();
+            let time_base = audio_stream.time_base();
+            let total_samples = ((duration as f64 * time_base.numerator() as f64
+                / time_base.denominator() as f64)
+                * source_sample_rate as f64) as usize;
+            total_samples
+        };
+
+        // Always create a context, either for resampling or for format conversion
+        let target_rate = target_sample_rate.unwrap_or(source_sample_rate);
+        let resampler = Context::get(
+            decoder.format(),
+            decoder.channel_layout(),
+            source_sample_rate,
+            decoder.format(),
+            decoder.channel_layout(),
+            target_rate,
+        )
+        .map_err(|e| AudioError::ResamplerCreation(e.to_string()))?;
 
         Ok(Self {
             decoder: Arc::new(Mutex::new(decoder)),
@@ -174,7 +125,29 @@ impl AudioReader {
             channels,
             buffer: Arc::new(Mutex::new(Vec::new())),
             chunk_size,
+            source_sample_rate,
+            target_sample_rate,
+            total_samples,
         })
+    }
+
+    #[getter]
+    fn sample_rate(&self) -> u32 {
+        self.target_sample_rate.unwrap_or(self.source_sample_rate)
+    }
+
+    #[getter]
+    fn source_sample_rate(&self) -> u32 {
+        self.source_sample_rate
+    }
+
+    #[getter]
+    fn channels(&self) -> usize {
+        self.channels
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.total_samples)
     }
 
     fn __iter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
@@ -184,10 +157,10 @@ impl AudioReader {
     fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Bound<'_, PyArray2<f32>>>> {
         let this = slf.borrow_mut();
 
-        let input = Arc::clone(&this.input);
-        let decoder = Arc::clone(&this.decoder);
-        let resampler = Arc::clone(&this.resampler);
-        let buffer = Arc::clone(&this.buffer);
+        let input = this.input.clone();
+        let decoder = this.decoder.clone();
+        let resampler = this.resampler.clone();
+        let buffer = this.buffer.clone();
         let stream_index = this.stream_index;
         let channels = this.channels;
         let chunk_size = this.chunk_size;
@@ -195,14 +168,11 @@ impl AudioReader {
         let array = Python::allow_threads(
             slf.py(),
             move || -> Result<Option<ndarray::Array2<f32>>, PyErr> {
-                // Get all locks once at the start
                 let mut buffer = buffer.lock().unwrap();
-                let mut input = input.lock().unwrap();
-                let mut decoder = decoder.lock().unwrap();
-                let mut resampler = resampler.lock().unwrap();
 
                 // Keep reading packets until we have enough samples or reach EOF
                 while buffer.len() < chunk_size * channels {
+                    let mut input = input.lock().unwrap();
                     match input.packets().next() {
                         Some((stream, packet)) => {
                             if stream.index() != stream_index {
@@ -210,6 +180,7 @@ impl AudioReader {
                             }
 
                             let mut frame = Audio::empty();
+                            let mut decoder = decoder.lock().unwrap();
                             decoder
                                 .send_packet(&packet)
                                 .map_err(|e| AudioError::PacketSend(e.to_string()))?;
@@ -217,12 +188,24 @@ impl AudioReader {
                             match decoder.receive_frame(&mut frame) {
                                 Ok(_) => {
                                     let mut output_frame = Audio::empty();
+                                    let mut resampler = resampler.lock().unwrap();
                                     resampler
                                         .run(&frame, &mut output_frame)
                                         .map_err(|e| AudioError::ResampleError(e.to_string()))?;
 
-                                    // Append new samples to our buffer
-                                    buffer.extend_from_slice(output_frame.plane::<f32>(0));
+                                    // Handle both planar and packed formats
+                                    if output_frame.is_planar() {
+                                        // For planar (LLLLRRRR), interleave the channels
+                                        let samples_per_channel = output_frame.samples();
+                                        for i in 0..samples_per_channel {
+                                            for c in 0..channels {
+                                                buffer.push(output_frame.plane::<f32>(c)[i]);
+                                            }
+                                        }
+                                    } else {
+                                        // For packed (LRLRLR), just extend
+                                        buffer.extend_from_slice(output_frame.plane::<f32>(0));
+                                    }
                                 }
                                 Err(ffmpeg_next::Error::Other { errno: _ }) => continue,
                                 Err(e) => {
