@@ -129,12 +129,14 @@ struct AudioReader {
     resampler: Arc<Mutex<Context>>,
     stream_index: usize,
     channels: usize,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    chunk_size: usize,
 }
 
 #[pymethods]
 impl AudioReader {
     #[new]
-    fn new(file_path: String, target_sample_rate: u32) -> PyResult<Self> {
+    fn new(file_path: String, target_sample_rate: u32, chunk_size: usize) -> PyResult<Self> {
         ffmpeg::init().map_err(|e| AudioError::FFmpegInit(e.to_string()))?;
 
         let input = input(&file_path).map_err(|e| AudioError::FileOpen(e.to_string()))?;
@@ -170,6 +172,8 @@ impl AudioReader {
             resampler: Arc::new(Mutex::new(resampler)),
             stream_index,
             channels,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            chunk_size,
         })
     }
 
@@ -180,18 +184,21 @@ impl AudioReader {
     fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Bound<'_, PyArray2<f32>>>> {
         let this = slf.borrow_mut();
 
-        // First get all the data we need from the Python-specific parts
-        let input = this.input.clone();
-        let decoder = this.decoder.clone();
-        let resampler = this.resampler.clone();
+        let input = Arc::clone(&this.input);
+        let decoder = Arc::clone(&this.decoder);
+        let resampler = Arc::clone(&this.resampler);
+        let buffer = Arc::clone(&this.buffer);
         let stream_index = this.stream_index;
         let channels = this.channels;
+        let chunk_size = this.chunk_size;
 
-        // Release the GIL while processing packets
         let array = Python::allow_threads(
             slf.py(),
             move || -> Result<Option<ndarray::Array2<f32>>, PyErr> {
-                loop {
+                let mut buffer = buffer.lock().unwrap();
+
+                // Keep reading packets until we have enough samples or reach EOF
+                while buffer.len() < chunk_size * channels {
                     let mut input = input.lock().unwrap();
                     match input.packets().next() {
                         Some((stream, packet)) => {
@@ -213,14 +220,8 @@ impl AudioReader {
                                         .run(&frame, &mut output_frame)
                                         .map_err(|e| AudioError::ResampleError(e.to_string()))?;
 
-                                    let data = output_frame.plane::<f32>(0).to_vec();
-                                    let array = ndarray::Array2::from_shape_vec(
-                                        (channels, data.len() / channels),
-                                        data,
-                                    )
-                                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-                                    return Ok(Some(array));
+                                    // Append new samples to our buffer
+                                    buffer.extend_from_slice(output_frame.plane::<f32>(0));
                                 }
                                 Err(ffmpeg_next::Error::Other { errno: _ }) => continue,
                                 Err(e) => {
@@ -228,13 +229,31 @@ impl AudioReader {
                                 }
                             }
                         }
-                        None => return Ok(None),
+                        None => {
+                            // At EOF - return remaining samples or None if buffer is empty
+                            if buffer.is_empty() {
+                                return Ok(None);
+                            }
+                            break;
+                        }
                     }
                 }
+
+                // Extract up to chunk_size samples from the buffer
+                let samples_to_take = chunk_size.min(buffer.len() / channels) * channels;
+                if samples_to_take == 0 {
+                    return Ok(None);
+                }
+
+                let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
+                let array =
+                    ndarray::Array2::from_shape_vec((channels, samples_to_take / channels), chunk)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+                Ok(Some(array))
             },
         )?;
 
-        // Convert to PyArray only after reacquiring the GIL
         Ok(array.map(|arr| arr.into_pyarray(slf.py())))
     }
 }
