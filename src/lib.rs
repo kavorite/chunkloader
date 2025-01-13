@@ -180,44 +180,62 @@ impl AudioReader {
     fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Bound<'_, PyArray2<f32>>>> {
         let this = slf.borrow_mut();
 
-        loop {
-            let mut input = this.input.lock().unwrap();
-            match input.packets().next() {
-                Some((stream, packet)) => {
-                    if stream.index() != this.stream_index {
-                        continue;
-                    }
+        // First get all the data we need from the Python-specific parts
+        let input = this.input.clone();
+        let decoder = this.decoder.clone();
+        let resampler = this.resampler.clone();
+        let stream_index = this.stream_index;
+        let channels = this.channels;
 
-                    let mut frame = Audio::empty();
-                    let mut decoder = this.decoder.lock().unwrap();
-                    decoder
-                        .send_packet(&packet)
-                        .map_err(|e| AudioError::PacketSend(e.to_string()))?;
+        // Release the GIL while processing packets
+        let array = Python::allow_threads(
+            slf.py(),
+            move || -> Result<Option<ndarray::Array2<f32>>, PyErr> {
+                loop {
+                    let mut input = input.lock().unwrap();
+                    match input.packets().next() {
+                        Some((stream, packet)) => {
+                            if stream.index() != stream_index {
+                                continue;
+                            }
 
-                    match decoder.receive_frame(&mut frame) {
-                        Ok(_) => {
-                            let mut output_frame = Audio::empty();
-                            let mut resampler = this.resampler.lock().unwrap();
-                            resampler
-                                .run(&frame, &mut output_frame)
-                                .map_err(|e| AudioError::ResampleError(e.to_string()))?;
+                            let mut frame = Audio::empty();
+                            let mut decoder = decoder.lock().unwrap();
+                            decoder
+                                .send_packet(&packet)
+                                .map_err(|e| AudioError::PacketSend(e.to_string()))?;
 
-                            let data = output_frame.plane::<f32>(0).to_vec();
-                            let array = ndarray::Array2::from_shape_vec(
-                                (this.channels, data.len() / this.channels),
-                                data,
-                            )
-                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                            match decoder.receive_frame(&mut frame) {
+                                Ok(_) => {
+                                    let mut output_frame = Audio::empty();
+                                    let mut resampler = resampler.lock().unwrap();
+                                    resampler
+                                        .run(&frame, &mut output_frame)
+                                        .map_err(|e| AudioError::ResampleError(e.to_string()))?;
 
-                            return Ok(Some(array.into_pyarray(slf.py())));
+                                    let data = output_frame.plane::<f32>(0).to_vec();
+                                    let array = ndarray::Array2::from_shape_vec(
+                                        (channels, data.len() / channels),
+                                        data,
+                                    )
+                                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+                                    return Ok(Some(array));
+                                }
+                                Err(ffmpeg_next::Error::Other { errno: _ }) => continue,
+                                Err(e) => {
+                                    return Err(AudioError::FrameReceive(e.to_string()).into())
+                                }
+                            }
                         }
-                        Err(ffmpeg_next::Error::Other { errno: _ }) => continue,
-                        Err(e) => return Err(AudioError::FrameReceive(e.to_string()).into()),
+                        None => return Ok(None),
                     }
                 }
-                None => return Ok(None),
-            }
-        }
+            },
+        )?;
+
+        // Convert to PyArray only after reacquiring the GIL
+        Ok(array.map(|arr| arr.into_pyarray(slf.py())))
     }
 }
 
