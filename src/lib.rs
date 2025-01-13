@@ -19,7 +19,6 @@ enum AudioError {
     FileOpen(String),
     NoAudioStream,
     DecoderCreation(String),
-    NotStereo(usize),
     ResamplerCreation(String),
 }
 
@@ -34,7 +33,6 @@ impl std::fmt::Display for AudioError {
             AudioError::FileOpen(msg) => write!(f, "Failed to open file: {}", msg),
             AudioError::NoAudioStream => write!(f, "No audio stream found"),
             AudioError::DecoderCreation(msg) => write!(f, "Failed to get decoder: {}", msg),
-            AudioError::NotStereo(channels) => write!(f, "Expected 2 channels, found {}", channels),
             AudioError::ResamplerCreation(msg) => write!(f, "Failed to create resampler: {}", msg),
         }
     }
@@ -58,16 +56,18 @@ struct AudioReader {
     source_sample_rate: u32,
     target_sample_rate: Option<u32>,
     total_samples: usize,
+    force_mono: bool,
 }
 
 #[pymethods]
 impl AudioReader {
     #[new]
-    #[pyo3(signature = (file_path, target_sample_rate=None, chunk_size=1024))]
+    #[pyo3(signature = (file_path, target_sample_rate=None, chunk_size=1024, force_mono=false))]
     fn new(
         file_path: String,
         target_sample_rate: Option<u32>,
         chunk_size: usize,
+        force_mono: bool,
     ) -> PyResult<Self> {
         ffmpeg::init()
             .map_err(|e| PyValueError::new_err(format!("Failed to initialize FFmpeg: {}", e)))?;
@@ -94,10 +94,6 @@ impl AudioReader {
         let source_sample_rate = decoder.rate() as u32;
         let channels = decoder.channels() as usize;
         let channel_layout = decoder.channel_layout();
-
-        if channels != 2 {
-            return Err(AudioError::NotStereo(channels).into());
-        }
 
         // Calculate total duration if available
         let total_samples = {
@@ -132,6 +128,7 @@ impl AudioReader {
             source_sample_rate,
             target_sample_rate,
             total_samples,
+            force_mono,
         })
     }
 
@@ -189,12 +186,28 @@ impl AudioReader {
                             if output_frame.is_planar() {
                                 let samples_per_channel = output_frame.samples();
                                 for i in 0..samples_per_channel {
-                                    for c in 0..this.channels {
-                                        buffer.push(output_frame.plane::<f32>(c)[i]);
+                                    if this.force_mono {
+                                        let mut sample_sum = 0.0f32;
+                                        for c in 0..output_frame.channels() as usize {
+                                            sample_sum += output_frame.plane::<f32>(c)[i];
+                                        }
+                                        buffer.push(sample_sum / output_frame.channels() as f32);
+                                    } else {
+                                        for c in 0..output_frame.channels() as usize {
+                                            buffer.push(output_frame.plane::<f32>(c)[i]);
+                                        }
                                     }
                                 }
                             } else {
-                                buffer.extend_from_slice(output_frame.plane::<f32>(0));
+                                if this.force_mono {
+                                    let plane = output_frame.plane::<f32>(0);
+                                    for chunk in plane.chunks(output_frame.channels() as usize) {
+                                        let avg = chunk.iter().sum::<f32>() / chunk.len() as f32;
+                                        buffer.push(avg);
+                                    }
+                                } else {
+                                    buffer.extend_from_slice(output_frame.plane::<f32>(0));
+                                }
                             }
                             continue;
                         }
@@ -216,12 +229,28 @@ impl AudioReader {
                                     if output_frame.is_planar() {
                                         let samples_per_channel = output_frame.samples();
                                         for i in 0..samples_per_channel {
-                                            for c in 0..this.channels {
-                                                buffer.push(output_frame.plane::<f32>(c)[i]);
+                                            if this.force_mono {
+                                                let mut sample_sum = 0.0f32;
+                                                for c in 0..output_frame.channels() as usize {
+                                                    sample_sum += output_frame.plane::<f32>(c)[i];
+                                                }
+                                                buffer.push(sample_sum / output_frame.channels() as f32);
+                                            } else {
+                                                for c in 0..output_frame.channels() as usize {
+                                                    buffer.push(output_frame.plane::<f32>(c)[i]);
+                                                }
                                             }
                                         }
                                     } else {
-                                        buffer.extend_from_slice(output_frame.plane::<f32>(0));
+                                        if this.force_mono {
+                                            let plane = output_frame.plane::<f32>(0);
+                                            for chunk in plane.chunks(output_frame.channels() as usize) {
+                                                let avg = chunk.iter().sum::<f32>() / chunk.len() as f32;
+                                                buffer.push(avg);
+                                            }
+                                        } else {
+                                            buffer.extend_from_slice(output_frame.plane::<f32>(0));
+                                        }
                                     }
                                 }
                                 Err(e) => {}
@@ -257,17 +286,24 @@ impl AudioReader {
         }
 
         // Extract up to chunk_size samples from the buffer
-        let samples_to_take = this.chunk_size.min(buffer.len() / this.channels) * this.channels;
+        let output_channels = if this.force_mono { 1 } else { this.channels };
+        let samples_to_take = this.chunk_size.min(buffer.len() / output_channels) * output_channels;
         if samples_to_take == 0 {
             return Ok(None);
         }
 
         let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
-        let array = ndarray::Array2::from_shape_vec(
-            (samples_to_take / this.channels, this.channels),
-            chunk,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let array = if this.force_mono {
+            ndarray::Array2::from_shape_vec(
+                (samples_to_take, 1),
+                chunk,
+            )
+        } else {
+            ndarray::Array2::from_shape_vec(
+                (samples_to_take / this.channels, this.channels),
+                chunk,
+            )
+        }.map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         Ok(Some(array.into_pyarray(py)))
     }
