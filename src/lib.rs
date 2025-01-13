@@ -11,18 +11,104 @@ use symphonia::core::probe::Hint;
 use rubato::{Resampler, SincFixedIn, WindowFunction};
 use rubato::SincInterpolationParameters;
 use std::sync::Mutex;
+use std::sync::Arc;
 
 #[pyclass]
 struct AudioReader {
     file_path: String,
     target_sample_rate: u32,
-    buffer: Mutex<Vec<f32>>,
-    buffer_pos: Mutex<usize>,
-    decoder: Mutex<Option<Box<dyn symphonia::core::codecs::Decoder>>>,
-    format: Mutex<Option<Box<dyn symphonia::core::formats::FormatReader>>>,
-    resampler: Mutex<Option<SincFixedIn<f32>>>,
-    current_sample_rate: Mutex<u32>,
-    channels: Mutex<usize>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    buffer_pos: Arc<Mutex<usize>>,
+    decoder: Arc<Mutex<Option<Box<dyn symphonia::core::codecs::Decoder>>>>,
+    format: Arc<Mutex<Option<Box<dyn symphonia::core::formats::FormatReader>>>>,
+    resampler: Arc<Mutex<Option<SincFixedIn<f32>>>>,
+    current_sample_rate: Arc<Mutex<u32>>,
+    channels: Arc<Mutex<usize>>,
+}
+
+struct TempReader {
+    decoder: Arc<Mutex<Option<Box<dyn symphonia::core::codecs::Decoder>>>>,
+    format: Arc<Mutex<Option<Box<dyn symphonia::core::formats::FormatReader>>>>,
+    resampler: Arc<Mutex<Option<SincFixedIn<f32>>>>,
+    channels: usize,
+}
+
+impl TempReader {
+    fn decode_next_packet(&self) -> PyResult<Option<Vec<f32>>> {
+        let mut format_guard = self.format.lock().unwrap();
+        let mut decoder_guard = self.decoder.lock().unwrap();
+        
+        let format = format_guard.as_mut().unwrap();
+        let decoder = decoder_guard.as_mut().unwrap();
+
+        // Read next packet
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(symphonia::core::errors::Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(None);
+            }
+            Err(e) => return Err(PyValueError::new_err(format!("Error reading packet: {}", e))),
+        };
+
+        // Decode packet
+        let decoded = decoder.decode(&packet).map_err(|e| {
+            PyValueError::new_err(format!("Failed to decode packet: {}", e))
+        })?;
+
+        // Convert to f32 samples
+        let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        sample_buf.copy_interleaved_ref(decoded);
+        let samples = sample_buf.samples().to_vec();
+
+        // Use self.channels directly since it's now a usize
+        let num_channels = self.channels;
+
+        // Resample if needed
+        if let Some(resampler) = self.resampler.lock().unwrap().as_mut() {
+            let chunks: Vec<Vec<f32>> = samples
+                .chunks_exact(num_channels)
+                .map(|c| c.to_vec())
+                .collect();
+
+            let resampled = resampler.process(&chunks.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), None)
+                .map_err(|e| PyValueError::new_err(format!("Failed to resample: {}", e)))?;
+
+            // Flatten channels back to interleaved format
+            let mut result = Vec::new();
+            for i in 0..resampled[0].len() {
+                for channel in 0..num_channels {
+                    result.push(resampled[channel][i]);
+                }
+            }
+            Ok(Some(result))
+        } else {
+            Ok(Some(samples))
+        }
+    }
+
+    fn decode_until_size(&self, target_size: usize) -> PyResult<Option<Vec<f32>>> {
+        let mut accumulated = Vec::with_capacity(target_size);
+        
+        while accumulated.len() < target_size {
+            match self.decode_next_packet()? {
+                Some(samples) => {
+                    accumulated.extend(samples);
+                },
+                None => {
+                    if accumulated.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if accumulated.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(accumulated))
+        }
+    }
 }
 
 #[pymethods]
@@ -32,13 +118,13 @@ impl AudioReader {
         Ok(AudioReader {
             file_path,
             target_sample_rate,
-            buffer: Mutex::new(Vec::new()),
-            buffer_pos: Mutex::new(0),
-            decoder: Mutex::new(None),
-            format: Mutex::new(None),
-            resampler: Mutex::new(None),
-            current_sample_rate: Mutex::new(0),
-            channels: Mutex::new(0),
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            buffer_pos: Arc::new(Mutex::new(0)),
+            decoder: Arc::new(Mutex::new(None)),
+            format: Arc::new(Mutex::new(None)),
+            resampler: Arc::new(Mutex::new(None)),
+            current_sample_rate: Arc::new(Mutex::new(0)),
+            channels: Arc::new(Mutex::new(0)),
         })
     }
 
@@ -60,11 +146,31 @@ impl AudioReader {
 
     fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<(Vec<f32>, Vec<f32>)>> {
         let this = slf.borrow();
+        
+        // Initialize if needed (keep GIL)
         if this.decoder.lock().unwrap().is_none() {
             this.initialize()?;
         }
 
-        match this.decode_next_packet()? {
+        // Get channels value before creating TempReader
+        let channels = *this.channels.lock().unwrap();
+
+        // Create TempReader with Arc clones
+        let temp_reader = TempReader {
+            decoder: Arc::clone(&this.decoder),
+            format: Arc::clone(&this.format),
+            resampler: Arc::clone(&this.resampler),
+            channels,
+        };
+
+        // Release GIL for heavy processing
+        let chunk = Python::with_gil(|py| {
+            py.allow_threads(|| {
+                temp_reader.decode_until_size(1 << 20)
+            })
+        })?;
+
+        match chunk {
             Some(interleaved) => {
                 let mut left = Vec::with_capacity(interleaved.len() / 2);
                 let mut right = Vec::with_capacity(interleaved.len() / 2);
@@ -80,14 +186,31 @@ impl AudioReader {
         }
     }
 
-    // Get a single chunk of interleaved audio
-    fn get_next_chunk(slf: Bound<'_, Self>) -> PyResult<Option<Vec<f32>>> {
+    fn get_next_chunk(slf: Bound<'_, Self>, chunk_size: usize) -> PyResult<Option<Vec<f32>>> {
         let this = slf.borrow();
+        
+        // Initialize if needed (keep GIL)
         if this.decoder.lock().unwrap().is_none() {
             this.initialize()?;
         }
 
-        this.decode_next_packet()
+        // Get channels value before creating TempReader
+        let channels = *this.channels.lock().unwrap();
+
+        // Create TempReader with Arc clones
+        let temp_reader = TempReader {
+            decoder: Arc::clone(&this.decoder),
+            format: Arc::clone(&this.format),
+            resampler: Arc::clone(&this.resampler),
+            channels,
+        };
+
+        // Release GIL for heavy processing
+        Python::with_gil(|py| {
+            py.allow_threads(|| {
+                temp_reader.decode_until_size(chunk_size)
+            })
+        })
     }
 }
 
@@ -110,7 +233,7 @@ impl AudioReader {
             .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
             .map_err(|e| PyValueError::new_err(format!("Failed to probe media format: {}", e)))?;
 
-        let mut format = probed.format;
+        let format = probed.format;
         let track = format.default_track().ok_or_else(|| {
             PyValueError::new_err("No default track found")
         })?;
@@ -207,6 +330,32 @@ impl AudioReader {
             Ok(Some(result))
         } else {
             Ok(Some(samples))
+        }
+    }
+
+    // New method to accumulate samples until desired size
+    fn decode_until_size(&self, target_size: usize) -> PyResult<Option<Vec<f32>>> {
+        let mut accumulated = Vec::with_capacity(target_size);
+        
+        while accumulated.len() < target_size {
+            match self.decode_next_packet()? {
+                Some(samples) => {
+                    accumulated.extend(samples);
+                },
+                None => {
+                    // End of file reached
+                    if accumulated.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if accumulated.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(accumulated))
         }
     }
 }
