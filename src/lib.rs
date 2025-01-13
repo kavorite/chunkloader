@@ -72,6 +72,10 @@ impl AudioReader {
         ffmpeg::init()
             .map_err(|e| PyValueError::new_err(format!("Failed to initialize FFmpeg: {}", e)))?;
 
+        unsafe {
+            // ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_TRACE as i32);
+        }
+
         let input =
             ffmpeg::format::input(&file_path).map_err(|e| AudioError::FileOpen(e.to_string()))?;
 
@@ -107,6 +111,22 @@ impl AudioReader {
 
         // Always create a context, either for resampling or for format conversion
         let target_rate = target_sample_rate.unwrap_or(source_sample_rate);
+        println!(
+            "Creating resampler:\n\
+             - Input format: {:?}\n\
+             - Input layout: {:?}\n\
+             - Input rate: {}\n\
+             - Output format: {:?}\n\
+             - Output layout: {:?}\n\
+             - Output rate: {}",
+            decoder.format(),
+            decoder.channel_layout(),
+            source_sample_rate,
+            decoder.format(),
+            decoder.channel_layout(),
+            target_rate,
+        );
+
         let resampler = Context::get(
             decoder.format(),
             decoder.channel_layout(),
@@ -155,90 +175,142 @@ impl AudioReader {
     }
 
     fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Bound<'_, PyArray2<f32>>>> {
-        let this = slf.borrow_mut();
+        let mut this = slf.borrow_mut();
+        let py = slf.py();
 
-        let input = this.input.clone();
-        let decoder = this.decoder.clone();
-        let resampler = this.resampler.clone();
-        let buffer = this.buffer.clone();
-        let stream_index = this.stream_index;
-        let channels = this.channels;
-        let chunk_size = this.chunk_size;
+        let mut buffer = this.buffer.lock().unwrap();
+        let mut input = this.input.lock().unwrap();
+        let mut decoder = this.decoder.lock().unwrap();
+        let mut resampler = this.resampler.lock().unwrap();
 
-        let array = Python::allow_threads(
-            slf.py(),
-            move || -> Result<Option<ndarray::Array2<f32>>, PyErr> {
-                let mut buffer = buffer.lock().unwrap();
+        // Keep reading packets until we have enough samples or reach EOF
+        while buffer.len() < this.chunk_size * this.channels {
+            let mut frame = Audio::empty();
 
-                // Keep reading packets until we have enough samples or reach EOF
-                while buffer.len() < chunk_size * channels {
-                    let mut input = input.lock().unwrap();
-                    match input.packets().next() {
-                        Some((stream, packet)) => {
-                            if stream.index() != stream_index {
-                                continue;
+            // Try to receive frames from any remaining packets in decoder
+            match decoder.receive_frame(&mut frame) {
+                Ok(_) => {
+                    let mut output_frame = Audio::empty();
+                    output_frame.set_rate(this.target_sample_rate.unwrap_or(this.source_sample_rate) as u32);
+                    output_frame.set_format(frame.format());
+                    output_frame.set_channel_layout(frame.channel_layout());
+                    output_frame.set_channels(frame.channels() as u16);
+                    let new_samples = (frame.samples() as u64
+                        * this.target_sample_rate.unwrap_or(this.source_sample_rate) as u64
+                        / frame.rate() as u64) as usize;
+                    output_frame.set_samples(new_samples);
+
+                    match resampler.run(&frame, &mut output_frame) {
+                        Ok(_) => {
+                            if output_frame.is_planar() {
+                                let samples_per_channel = output_frame.samples();
+                                for i in 0..samples_per_channel {
+                                    for c in 0..this.channels {
+                                        buffer.push(output_frame.plane::<f32>(c)[i]);
+                                    }
+                                }
+                            } else {
+                                buffer.extend_from_slice(output_frame.plane::<f32>(0));
                             }
+                            continue;
+                        }
+                        Err(e) => {
+                            println!(
+                                "Warning: Resampler failed, attempting reset:\n\
+                                 - samples: {}\n\
+                                 - channels: {}\n\
+                                 - format: {:?}\n\
+                                 - rate: {}\n\
+                                 - pts: {:?}\n\
+                                 Error: {}",
+                                frame.samples(),
+                                frame.channels(),
+                                frame.format(),
+                                frame.rate(),
+                                frame.pts(),
+                                e
+                            );
 
-                            let mut frame = Audio::empty();
-                            let mut decoder = decoder.lock().unwrap();
-                            decoder
-                                .send_packet(&packet)
-                                .map_err(|e| AudioError::PacketSend(e.to_string()))?;
+                            // Create new resampler
+                            let new_resampler = Context::get(
+                                decoder.format(),
+                                decoder.channel_layout(),
+                                this.source_sample_rate,
+                                decoder.format(),
+                                decoder.channel_layout(),
+                                this.target_sample_rate.unwrap_or(this.source_sample_rate),
+                            )
+                            .map_err(|e| AudioError::ResamplerCreation(e.to_string()))?;
 
-                            match decoder.receive_frame(&mut frame) {
+                            // Replace the old resampler
+                            *resampler = new_resampler;
+
+                            // Try again with the new resampler
+                            match resampler.run(&frame, &mut output_frame) {
                                 Ok(_) => {
-                                    let mut output_frame = Audio::empty();
-                                    let mut resampler = resampler.lock().unwrap();
-                                    resampler
-                                        .run(&frame, &mut output_frame)
-                                        .map_err(|e| AudioError::ResampleError(e.to_string()))?;
-
-                                    // Handle both planar and packed formats
+                                    // Handle successful resampling after reset
                                     if output_frame.is_planar() {
-                                        // For planar (LLLLRRRR), interleave the channels
                                         let samples_per_channel = output_frame.samples();
                                         for i in 0..samples_per_channel {
-                                            for c in 0..channels {
+                                            for c in 0..this.channels {
                                                 buffer.push(output_frame.plane::<f32>(c)[i]);
                                             }
                                         }
                                     } else {
-                                        // For packed (LRLRLR), just extend
                                         buffer.extend_from_slice(output_frame.plane::<f32>(0));
                                     }
                                 }
-                                Err(ffmpeg_next::Error::Other { errno: _ }) => continue,
                                 Err(e) => {
-                                    return Err(AudioError::FrameReceive(e.to_string()).into())
+                                    println!(
+                                        "Warning: Frame still failed after resampler reset: {}",
+                                        e
+                                    );
                                 }
                             }
-                        }
-                        None => {
-                            // At EOF - return remaining samples or None if buffer is empty
-                            if buffer.is_empty() {
-                                return Ok(None);
-                            }
-                            break;
+                            continue;
                         }
                     }
                 }
+                Err(ffmpeg_next::Error::Other { errno: _ }) => {}
+                Err(e) => return Err(AudioError::FrameReceive(e.to_string()).into()),
+            }
 
-                // Extract up to chunk_size samples from the buffer
-                let samples_to_take = chunk_size.min(buffer.len() / channels) * channels;
-                if samples_to_take == 0 {
-                    return Ok(None);
+            // Get next packet
+            match input.packets().next() {
+                Some((stream, packet)) => {
+                    if stream.index() != this.stream_index {
+                        continue;
+                    }
+                    decoder
+                        .send_packet(&packet)
+                        .map_err(|e| AudioError::PacketSend(e.to_string()))?;
                 }
+                None => {
+                    decoder
+                        .send_eof()
+                        .map_err(|e| AudioError::PacketSend(e.to_string()))?;
+                    if buffer.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+            }
+        }
 
-                let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
-                let array =
-                    ndarray::Array2::from_shape_vec((samples_to_take / channels, channels), chunk)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // Extract up to chunk_size samples from the buffer
+        let samples_to_take = this.chunk_size.min(buffer.len() / this.channels) * this.channels;
+        if samples_to_take == 0 {
+            return Ok(None);
+        }
 
-                Ok(Some(array))
-            },
-        )?;
+        let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
+        let array = ndarray::Array2::from_shape_vec(
+            (samples_to_take / this.channels, this.channels),
+            chunk,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        Ok(array.map(|arr| arr.into_pyarray(slf.py())))
+        Ok(Some(array.into_pyarray(py)))
     }
 }
 
