@@ -247,7 +247,7 @@ impl AudioReader {
 
                 let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
                 let array =
-                    ndarray::Array2::from_shape_vec((channels, samples_to_take / channels), chunk)
+                    ndarray::Array2::from_shape_vec((samples_to_take / channels, channels), chunk)
                         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
                 Ok(Some(array))
