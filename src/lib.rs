@@ -39,6 +39,12 @@ impl From<AudioError> for PyErr {
     }
 }
 
+impl From<ffmpeg_next::Error> for AudioError {
+    fn from(err: ffmpeg_next::Error) -> Self {
+        AudioError::PacketSend(err.to_string())
+    }
+}
+
 #[pyclass]
 #[derive(Clone)]
 struct AudioReader {
@@ -182,155 +188,164 @@ impl AudioReaderIterator {
 
     fn __next__(slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyArray2<f32>>>> {
         let reader = &slf.reader;
+        let mut frame = Audio::empty();
+        let output_channels = if reader.force_mono { 1 } else { reader.channels };
+
+        // Pre-allocate output_frame outside the loop
+        let mut output_frame = Audio::empty();
         
-        let mut buffer = reader.buffer.lock().unwrap();
-        let mut input = reader.input.lock().unwrap();
-        let mut decoder = reader.decoder.lock().unwrap();
-        let mut resampler = reader.resampler.lock().unwrap();
+        // Release GIL during FFmpeg operations
+        let result: Result<Vec<f32>, AudioError> = py.allow_threads(|| {
+            let mut buffer = reader.buffer.lock().unwrap();
+            let mut input = reader.input.lock().unwrap();
+            let mut decoder = reader.decoder.lock().unwrap();
+            let mut resampler = reader.resampler.lock().unwrap();
 
-        // Keep reading packets until we have enough samples or reach EOF
-        while buffer.len() < reader.chunk_size * reader.channels {
-            let mut frame = Audio::empty();
+            // Reuse output_frame configuration
+            output_frame.set_rate(reader.target_sample_rate.unwrap_or(reader.source_sample_rate));
+            output_frame.set_format(decoder.format());
+            output_frame.set_channel_layout(decoder.channel_layout());
+            output_frame.set_channels(decoder.channels());
 
-            // Try to receive frames from any remaining packets in decoder
-            match decoder.receive_frame(&mut frame) {
-                Ok(_) => {
-                    let mut output_frame = Audio::empty();
-                    output_frame.set_rate(reader.target_sample_rate.unwrap_or(reader.source_sample_rate) as u32);
-                    output_frame.set_format(frame.format());
-                    output_frame.set_channel_layout(frame.channel_layout());
-                    output_frame.set_channels(frame.channels() as u16);
-                    let new_samples = (frame.samples() as u64
-                        * reader.target_sample_rate.unwrap_or(reader.source_sample_rate) as u64
-                        / frame.rate() as u64) as usize;
-                    output_frame.set_samples(new_samples);
+            // Keep reading packets until we have enough samples or reach EOF
+            while buffer.len() < reader.chunk_size * reader.channels {
+                // Try to receive frames from any remaining packets in decoder
+                match decoder.receive_frame(&mut frame) {
+                    Ok(_) => {
+                        let new_samples = (frame.samples() as u64
+                            * reader.target_sample_rate.unwrap_or(reader.source_sample_rate) as u64
+                            / frame.rate() as u64) as usize;
+                        output_frame.set_samples(new_samples);
 
-                    match resampler.run(&frame, &mut output_frame) {
-                        Ok(_) => {
-                            if output_frame.is_planar() {
-                                let samples_per_channel = output_frame.samples();
-                                for i in 0..samples_per_channel {
-                                    if reader.force_mono {
-                                        let mut sample_sum = 0.0f32;
-                                        for c in 0..output_frame.channels() as usize {
-                                            sample_sum += output_frame.plane::<f32>(c)[i];
+                        match resampler.run(&frame, &mut output_frame) {
+                            Ok(_) => {
+                                if output_frame.is_planar() {
+                                    let samples_per_channel = output_frame.samples();
+                                    for i in 0..samples_per_channel {
+                                        if reader.force_mono {
+                                            let mut sample_sum = 0.0f32;
+                                            for c in 0..output_frame.channels() as usize {
+                                                sample_sum += output_frame.plane::<f32>(c)[i];
+                                            }
+                                            buffer.push(sample_sum / output_frame.channels() as f32);
+                                        } else {
+                                            for c in 0..output_frame.channels() as usize {
+                                                buffer.push(output_frame.plane::<f32>(c)[i]);
+                                            }
                                         }
-                                        buffer.push(sample_sum / output_frame.channels() as f32);
-                                    } else {
-                                        for c in 0..output_frame.channels() as usize {
-                                            buffer.push(output_frame.plane::<f32>(c)[i]);
-                                        }
-                                    }
-                                }
-                            } else {
-                                if reader.force_mono {
-                                    let plane = output_frame.plane::<f32>(0);
-                                    for chunk in plane.chunks(output_frame.channels() as usize) {
-                                        let avg = chunk.iter().sum::<f32>() / chunk.len() as f32;
-                                        buffer.push(avg);
                                     }
                                 } else {
-                                    buffer.extend_from_slice(output_frame.plane::<f32>(0));
-                                }
-                            }
-                            continue;
-                        }
-                        Err(_e) => {
-                            let new_resampler = Context::get(
-                                decoder.format(),
-                                decoder.channel_layout(),
-                                reader.source_sample_rate,
-                                decoder.format(),
-                                decoder.channel_layout(),
-                                reader.target_sample_rate.unwrap_or(reader.source_sample_rate),
-                            )
-                            .map_err(|e| AudioError::ResamplerCreation(e.to_string()))?;
-
-                            *resampler = new_resampler;
-
-                            match resampler.run(&frame, &mut output_frame) {
-                                Ok(_) => {
-                                    if output_frame.is_planar() {
-                                        let samples_per_channel = output_frame.samples();
-                                        for i in 0..samples_per_channel {
-                                            if reader.force_mono {
-                                                let mut sample_sum = 0.0f32;
-                                                for c in 0..output_frame.channels() as usize {
-                                                    sample_sum += output_frame.plane::<f32>(c)[i];
-                                                }
-                                                buffer.push(sample_sum / output_frame.channels() as f32);
-                                            } else {
-                                                for c in 0..output_frame.channels() as usize {
-                                                    buffer.push(output_frame.plane::<f32>(c)[i]);
-                                                }
-                                            }
+                                    if reader.force_mono {
+                                        let plane = output_frame.plane::<f32>(0);
+                                        for chunk in plane.chunks(output_frame.channels() as usize) {
+                                            let avg = chunk.iter().sum::<f32>() / chunk.len() as f32;
+                                            buffer.push(avg);
                                         }
                                     } else {
-                                        if reader.force_mono {
-                                            let plane = output_frame.plane::<f32>(0);
-                                            for chunk in plane.chunks(output_frame.channels() as usize) {
-                                                let avg = chunk.iter().sum::<f32>() / chunk.len() as f32;
-                                                buffer.push(avg);
-                                            }
-                                        } else {
-                                            buffer.extend_from_slice(output_frame.plane::<f32>(0));
-                                        }
+                                        buffer.extend_from_slice(output_frame.plane::<f32>(0));
                                     }
                                 }
-                                Err(_e) => {}
+                                Ok(())
                             }
-                            continue;
+                            Err(_) => {
+                                let new_resampler = Context::get(
+                                    decoder.format(),
+                                    decoder.channel_layout(),
+                                    reader.source_sample_rate,
+                                    decoder.format(),
+                                    decoder.channel_layout(),
+                                    reader.target_sample_rate.unwrap_or(reader.source_sample_rate),
+                                ).map_err(|e| AudioError::ResamplerCreation(e.to_string()))?;
+
+                                *resampler = new_resampler;
+                                Ok(())
+                            }
                         }
                     }
-                }
-                Err(ffmpeg_next::Error::Other { errno: _ }) => {}
-                Err(_) => {
-                    // Instead of returning an error, just try to get the next packet
-                }
+                    Err(ffmpeg_next::Error::Other { errno: _ }) => Ok(()),
+                    Err(e) => Err(AudioError::from(e))
+                }?;
+
+                // Get next packet
+                match input.packets().next() {
+                    Some((stream, packet)) => {
+                        if stream.index() != reader.stream_index {
+                            Ok(())
+                        } else {
+                            decoder.send_packet(&packet).map_err(AudioError::from)
+                        }
+                    }
+                    None => {
+                        let _ = decoder.send_eof();
+                        if buffer.is_empty() && unsafe { frame.is_empty() } {
+                            break;
+                        }
+                        Ok(())
+                    }
+                }?;
             }
 
-            // Get next packet
-            match input.packets().next() {
-                Some((stream, packet)) => {
-                    if stream.index() != reader.stream_index {
-                        continue;
-                    }
-                    decoder
-                        .send_packet(&packet)
-                        .map_err(|e| AudioError::PacketSend(e.to_string()))?;
-                }
-                None => {
-                    // At EOF, just send EOF to decoder and break if no more data
-                    let _ = decoder.send_eof();
+            // Instead of collecting into intermediate Vec, directly create the final Vec
+            let samples_to_take = reader.chunk_size.min(buffer.len() / output_channels) * output_channels;
+            if samples_to_take > 0 {
+                // Drain directly into the final Vec with pre-allocated capacity
+                let mut chunk = Vec::with_capacity(samples_to_take);
+                chunk.extend(buffer.drain(..samples_to_take));
+                Ok(chunk)
+            } else {
+                Ok(Vec::new())
+            }
+        });
+
+        match result {
+            Ok(chunk_data) if !chunk_data.is_empty() => {
+                // Create array shape outside GIL
+                let shape = if reader.force_mono {
+                    (chunk_data.len(), 1)
+                } else {
+                    (chunk_data.len() / reader.channels, reader.channels)
+                };
+
+                // Create array directly from the chunk_data without additional copies
+                let array = py.allow_threads(|| {
+                    ndarray::Array2::from_shape_vec(shape, chunk_data)
+                }).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+                Ok(Some(array.into_pyarray(py).into()))
+            }
+            Ok(_) => Ok(None),
+            Err(e) => {
+                if e.to_string().contains("End of file") {
+                    // Only treat EOF as normal if we have no data to return
+                    let buffer = reader.buffer.lock().unwrap();
                     if buffer.is_empty() {
-                        return Ok(None);
+                        Ok(None)
+                    } else {
+                        drop(buffer);
+                        // Process the remaining buffer data
+                        let mut buffer = reader.buffer.lock().unwrap();
+                        let output_channels = if reader.force_mono { 1 } else { reader.channels };
+                        let samples_to_take = reader.chunk_size.min(buffer.len() / output_channels) * output_channels;
+                        let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
+                        let array = if reader.force_mono {
+                            ndarray::Array2::from_shape_vec(
+                                (samples_to_take, 1),
+                                chunk,
+                            )
+                        } else {
+                            ndarray::Array2::from_shape_vec(
+                                (samples_to_take / reader.channels, reader.channels),
+                                chunk,
+                            )
+                        }.map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+                        Ok(Some(array.into_pyarray(py).into()))
                     }
-                    break;
+                } else {
+                    Err(e.into())
                 }
             }
         }
-
-        // Extract up to chunk_size samples from the buffer
-        let output_channels = if reader.force_mono { 1 } else { reader.channels };
-        let samples_to_take = reader.chunk_size.min(buffer.len() / output_channels) * output_channels;
-        if samples_to_take == 0 {
-            return Ok(None);
-        }
-
-        let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
-        let array = if reader.force_mono {
-            ndarray::Array2::from_shape_vec(
-                (samples_to_take, 1),
-                chunk,
-            )
-        } else {
-            ndarray::Array2::from_shape_vec(
-                (samples_to_take / reader.channels, reader.channels),
-                chunk,
-            )
-        }.map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        Ok(Some(array.into_pyarray(py).into()))
     }
 }
 
