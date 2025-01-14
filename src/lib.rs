@@ -45,6 +45,7 @@ impl From<AudioError> for PyErr {
 }
 
 #[pyclass]
+#[derive(Clone)]
 struct AudioReader {
     decoder: Arc<Mutex<ffmpeg::decoder::Audio>>,
     input: Arc<Mutex<input::Input>>,
@@ -57,6 +58,11 @@ struct AudioReader {
     target_sample_rate: Option<u32>,
     total_samples: usize,
     force_mono: bool,
+}
+
+#[pyclass]
+struct AudioReaderIterator {
+    reader: AudioReader,
 }
 
 #[pymethods]
@@ -151,33 +157,41 @@ impl AudioReader {
         Ok(self.total_samples)
     }
 
-    fn __iter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<AudioReaderIterator> {
+        Ok(AudioReaderIterator {
+            reader: slf.clone(),
+        })
+    }
+}
+
+#[pymethods]
+impl AudioReaderIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Bound<'_, PyArray2<f32>>>> {
-        let this = slf.borrow_mut();
-        let py = slf.py();
-
-        let mut buffer = this.buffer.lock().unwrap();
-        let mut input = this.input.lock().unwrap();
-        let mut decoder = this.decoder.lock().unwrap();
-        let mut resampler = this.resampler.lock().unwrap();
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyArray2<f32>>>> {
+        let reader = &slf.reader;
+        
+        let mut buffer = reader.buffer.lock().unwrap();
+        let mut input = reader.input.lock().unwrap();
+        let mut decoder = reader.decoder.lock().unwrap();
+        let mut resampler = reader.resampler.lock().unwrap();
 
         // Keep reading packets until we have enough samples or reach EOF
-        while buffer.len() < this.chunk_size * this.channels {
+        while buffer.len() < reader.chunk_size * reader.channels {
             let mut frame = Audio::empty();
 
             // Try to receive frames from any remaining packets in decoder
             match decoder.receive_frame(&mut frame) {
                 Ok(_) => {
                     let mut output_frame = Audio::empty();
-                    output_frame.set_rate(this.target_sample_rate.unwrap_or(this.source_sample_rate) as u32);
+                    output_frame.set_rate(reader.target_sample_rate.unwrap_or(reader.source_sample_rate) as u32);
                     output_frame.set_format(frame.format());
                     output_frame.set_channel_layout(frame.channel_layout());
                     output_frame.set_channels(frame.channels() as u16);
                     let new_samples = (frame.samples() as u64
-                        * this.target_sample_rate.unwrap_or(this.source_sample_rate) as u64
+                        * reader.target_sample_rate.unwrap_or(reader.source_sample_rate) as u64
                         / frame.rate() as u64) as usize;
                     output_frame.set_samples(new_samples);
 
@@ -186,7 +200,7 @@ impl AudioReader {
                             if output_frame.is_planar() {
                                 let samples_per_channel = output_frame.samples();
                                 for i in 0..samples_per_channel {
-                                    if this.force_mono {
+                                    if reader.force_mono {
                                         let mut sample_sum = 0.0f32;
                                         for c in 0..output_frame.channels() as usize {
                                             sample_sum += output_frame.plane::<f32>(c)[i];
@@ -199,7 +213,7 @@ impl AudioReader {
                                     }
                                 }
                             } else {
-                                if this.force_mono {
+                                if reader.force_mono {
                                     let plane = output_frame.plane::<f32>(0);
                                     for chunk in plane.chunks(output_frame.channels() as usize) {
                                         let avg = chunk.iter().sum::<f32>() / chunk.len() as f32;
@@ -215,10 +229,10 @@ impl AudioReader {
                             let new_resampler = Context::get(
                                 decoder.format(),
                                 decoder.channel_layout(),
-                                this.source_sample_rate,
+                                reader.source_sample_rate,
                                 decoder.format(),
                                 decoder.channel_layout(),
-                                this.target_sample_rate.unwrap_or(this.source_sample_rate),
+                                reader.target_sample_rate.unwrap_or(reader.source_sample_rate),
                             )
                             .map_err(|e| AudioError::ResamplerCreation(e.to_string()))?;
 
@@ -229,7 +243,7 @@ impl AudioReader {
                                     if output_frame.is_planar() {
                                         let samples_per_channel = output_frame.samples();
                                         for i in 0..samples_per_channel {
-                                            if this.force_mono {
+                                            if reader.force_mono {
                                                 let mut sample_sum = 0.0f32;
                                                 for c in 0..output_frame.channels() as usize {
                                                     sample_sum += output_frame.plane::<f32>(c)[i];
@@ -242,7 +256,7 @@ impl AudioReader {
                                             }
                                         }
                                     } else {
-                                        if this.force_mono {
+                                        if reader.force_mono {
                                             let plane = output_frame.plane::<f32>(0);
                                             for chunk in plane.chunks(output_frame.channels() as usize) {
                                                 let avg = chunk.iter().sum::<f32>() / chunk.len() as f32;
@@ -266,7 +280,7 @@ impl AudioReader {
             // Get next packet
             match input.packets().next() {
                 Some((stream, packet)) => {
-                    if stream.index() != this.stream_index {
+                    if stream.index() != reader.stream_index {
                         continue;
                     }
                     decoder
@@ -286,26 +300,26 @@ impl AudioReader {
         }
 
         // Extract up to chunk_size samples from the buffer
-        let output_channels = if this.force_mono { 1 } else { this.channels };
-        let samples_to_take = this.chunk_size.min(buffer.len() / output_channels) * output_channels;
+        let output_channels = if reader.force_mono { 1 } else { reader.channels };
+        let samples_to_take = reader.chunk_size.min(buffer.len() / output_channels) * output_channels;
         if samples_to_take == 0 {
             return Ok(None);
         }
 
         let chunk: Vec<f32> = buffer.drain(..samples_to_take).collect();
-        let array = if this.force_mono {
+        let array = if reader.force_mono {
             ndarray::Array2::from_shape_vec(
                 (samples_to_take, 1),
                 chunk,
             )
         } else {
             ndarray::Array2::from_shape_vec(
-                (samples_to_take / this.channels, this.channels),
+                (samples_to_take / reader.channels, reader.channels),
                 chunk,
             )
         }.map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-        Ok(Some(array.into_pyarray(py)))
+        Ok(Some(array.into_pyarray(py).into()))
     }
 }
 
