@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::format::context::input;
-use ffmpeg_next::format::Sample;
 use ffmpeg_next::media::Type;
 use ffmpeg_next::software::resampling::context::Context;
 use ffmpeg_next::util::frame::audio::Audio;
@@ -14,7 +13,6 @@ use pyo3::prelude::*;
 #[derive(Debug)]
 enum AudioError {
     PacketSend(String),
-    ResampleError(String),
     FrameReceive(String),
     FileOpen(String),
     NoAudioStream,
@@ -28,7 +26,6 @@ impl std::fmt::Display for AudioError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             AudioError::PacketSend(msg) => write!(f, "Failed to send packet: {}", msg),
-            AudioError::ResampleError(msg) => write!(f, "Failed to resample: {}", msg),
             AudioError::FrameReceive(msg) => write!(f, "Failed to receive frame: {}", msg),
             AudioError::FileOpen(msg) => write!(f, "Failed to open file: {}", msg),
             AudioError::NoAudioStream => write!(f, "No audio stream found"),
@@ -99,7 +96,7 @@ impl AudioReader {
 
         let source_sample_rate = decoder.rate() as u32;
         let channels = decoder.channels() as usize;
-        let channel_layout = decoder.channel_layout();
+        let _channel_layout = decoder.channel_layout();
 
         // Calculate total duration if available
         let total_samples = {
@@ -170,7 +167,7 @@ impl AudioReaderIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyArray2<f32>>>> {
+    fn __next__(slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyArray2<f32>>>> {
         let reader = &slf.reader;
         
         let mut buffer = reader.buffer.lock().unwrap();
@@ -225,7 +222,7 @@ impl AudioReaderIterator {
                             }
                             continue;
                         }
-                        Err(e) => {
+                        Err(_e) => {
                             let new_resampler = Context::get(
                                 decoder.format(),
                                 decoder.channel_layout(),
@@ -267,7 +264,7 @@ impl AudioReaderIterator {
                                         }
                                     }
                                 }
-                                Err(e) => {}
+                                Err(_e) => {}
                             }
                             continue;
                         }
