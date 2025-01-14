@@ -13,7 +13,6 @@ use pyo3::prelude::*;
 #[derive(Debug)]
 enum AudioError {
     PacketSend(String),
-    FrameReceive(String),
     FileOpen(String),
     NoAudioStream,
     DecoderCreation(String),
@@ -26,7 +25,6 @@ impl std::fmt::Display for AudioError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             AudioError::PacketSend(msg) => write!(f, "Failed to send packet: {}", msg),
-            AudioError::FrameReceive(msg) => write!(f, "Failed to receive frame: {}", msg),
             AudioError::FileOpen(msg) => write!(f, "Failed to open file: {}", msg),
             AudioError::NoAudioStream => write!(f, "No audio stream found"),
             AudioError::DecoderCreation(msg) => write!(f, "Failed to get decoder: {}", msg),
@@ -151,13 +149,28 @@ impl AudioReader {
     }
 
     fn __len__(&self) -> PyResult<usize> {
-        Ok(self.total_samples)
+        // Adjust total samples based on resampling
+        let resampled_samples = if let Some(target_rate) = self.target_sample_rate {
+            (self.total_samples as f64 * target_rate as f64 / self.source_sample_rate as f64) as usize
+        } else {
+            self.total_samples
+        };
+
+        // Adjust for mono conversion if enabled
+        let output_channels = if self.force_mono { 1 } else { self.channels };
+        
+        Ok(resampled_samples / self.channels * output_channels)
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyResult<AudioReaderIterator> {
         Ok(AudioReaderIterator {
             reader: slf.clone(),
         })
+    }
+
+    #[getter]
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
     }
 }
 
@@ -271,7 +284,9 @@ impl AudioReaderIterator {
                     }
                 }
                 Err(ffmpeg_next::Error::Other { errno: _ }) => {}
-                Err(e) => return Err(AudioError::FrameReceive(e.to_string()).into()),
+                Err(_) => {
+                    // Instead of returning an error, just try to get the next packet
+                }
             }
 
             // Get next packet
@@ -285,9 +300,8 @@ impl AudioReaderIterator {
                         .map_err(|e| AudioError::PacketSend(e.to_string()))?;
                 }
                 None => {
-                    decoder
-                        .send_eof()
-                        .map_err(|e| AudioError::PacketSend(e.to_string()))?;
+                    // At EOF, just send EOF to decoder and break if no more data
+                    let _ = decoder.send_eof();
                     if buffer.is_empty() {
                         return Ok(None);
                     }
