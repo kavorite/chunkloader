@@ -438,8 +438,19 @@ fn process_audio_data(reader: &AudioReader, buffer: &mut Vec<f32>) -> Result<Vec
     }
 }
 
+#[pyfunction]
+#[pyo3(signature = (path, target_sample_rate=None, force_mono=false))]
+fn load(path: String, target_sample_rate: Option<u32>, force_mono: bool, py: Python<'_>) -> PyResult<Py<PyArray2<f32>>> {
+    let reader = AudioReader::new(path, target_sample_rate, 1024, force_mono)?;
+    let total_samples = reader.__len__()?;
+    
+    // Decode all samples at once since we know the total length
+    reader.decode_samples(total_samples, py)
+}
+
 #[pymodule]
 fn chunkloader(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_class::<AudioReader>()?;
     Ok(())
 }
