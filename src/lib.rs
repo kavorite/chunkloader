@@ -7,8 +7,10 @@ use ffmpeg_next::software::resampling::context::Context;
 use ffmpeg_next::util::frame::audio::Audio;
 use ndarray;
 use numpy::{IntoPyArray, PyArray2};
+use numpy::{PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use ndarray::s;
 
 #[derive(Debug)]
 enum AudioError {
@@ -17,6 +19,8 @@ enum AudioError {
     NoAudioStream,
     DecoderCreation(String),
     ResamplerCreation(String),
+    FFmpeg(String),
+    Conversion(String),
 }
 
 impl std::error::Error for AudioError {}
@@ -29,6 +33,8 @@ impl std::fmt::Display for AudioError {
             AudioError::NoAudioStream => write!(f, "No audio stream found"),
             AudioError::DecoderCreation(msg) => write!(f, "Failed to get decoder: {}", msg),
             AudioError::ResamplerCreation(msg) => write!(f, "Failed to create resampler: {}", msg),
+            AudioError::FFmpeg(msg) => write!(f, "FFmpeg error: {}", msg),
+            AudioError::Conversion(msg) => write!(f, "Conversion error: {}", msg),
         }
     }
 }
@@ -41,7 +47,7 @@ impl From<AudioError> for PyErr {
 
 impl From<ffmpeg_next::Error> for AudioError {
     fn from(err: ffmpeg_next::Error) -> Self {
-        AudioError::PacketSend(err.to_string())
+        AudioError::FFmpeg(err.to_string())
     }
 }
 
@@ -440,17 +446,184 @@ fn process_audio_data(reader: &AudioReader, buffer: &mut Vec<f32>) -> Result<Vec
 
 #[pyfunction]
 #[pyo3(signature = (path, target_sample_rate=None, force_mono=false))]
-fn load(path: String, target_sample_rate: Option<u32>, force_mono: bool, py: Python<'_>) -> PyResult<Py<PyArray2<f32>>> {
+fn load(
+    path: String,
+    target_sample_rate: Option<u32>,
+    force_mono: bool,
+    py: Python<'_>,
+) -> PyResult<Py<PyArray2<f32>>> {
     let reader = AudioReader::new(path, target_sample_rate, 1024, force_mono)?;
     let total_samples = reader.__len__()?;
-    
+
     // Decode all samples at once since we know the total length
     reader.decode_samples(total_samples, py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, data, sample_rate))]
+fn write(path: String, data: &Bound<'_, PyArray2<f32>>, sample_rate: u32) -> PyResult<()> {
+    ffmpeg::init().map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+
+    let mut output = ffmpeg::format::output(&path).map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+    
+    // Get array info and ensure correct shape [samples, channels]
+    let array = data.readonly();
+    let array = if !array.is_contiguous() {
+        array.as_array().to_owned()
+    } else {
+        array.as_array().to_owned()
+    };
+    let num_samples = array.shape()[0];
+    let num_channels = array.shape()[1];
+    
+    let codec_id = output.format().codec(&path, ffmpeg::media::Type::Audio);
+    let global_header = output
+        .format()
+        .flags()
+        .contains(ffmpeg::format::flag::Flags::GLOBAL_HEADER);
+
+    let codec = ffmpeg::encoder::find(codec_id)
+        .ok_or_else(|| AudioError::FFmpeg("Encoder not found".to_string()))?
+        .audio()
+        .map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+
+    let channel_layout = ffmpeg::channel_layout::ChannelLayout::default(num_channels.try_into()?);
+    
+    // Get supported format
+    let sample_format = codec
+        .formats()
+        .expect("unknown supported formats")
+        .next()
+        .unwrap();
+
+    let mut stream = output
+        .add_stream(codec)
+        .map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+
+    // Set stream time base to match sample rate
+    stream.set_time_base((1, sample_rate.try_into()?));
+
+    // Create context from stream parameters first
+    let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+    let mut encoder = context
+        .encoder()
+        .audio()
+        .map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+
+    if global_header {
+        encoder.set_flags(ffmpeg::codec::flag::Flags::GLOBAL_HEADER);
+    }
+
+    // Set all parameters before opening the encoder
+    encoder.set_rate(sample_rate.try_into()?);
+    encoder.set_channel_layout(channel_layout);
+    encoder.set_channels(channel_layout.channels());
+    encoder.set_format(sample_format);
+    encoder.set_time_base((1, sample_rate.try_into()?));  // Match stream time base
+    encoder.set_bit_rate(320_000);
+
+    // Open encoder with codec
+    let mut encoder = encoder
+        .open_as(codec)
+        .map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+
+    // Set stream parameters AFTER opening encoder
+    stream.set_parameters(&encoder);
+
+    // Get time bases BEFORE writing header
+    let in_time_base = encoder.time_base();
+    let out_time_base = stream.time_base();
+
+    // Write header AFTER setting stream parameters
+    output
+        .write_header()
+        .map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+
+    let frame_size = encoder.frame_size() as usize;
+    
+    let mut frame = ffmpeg::frame::Audio::new(
+        sample_format,
+        frame_size,
+        channel_layout,
+    );
+    frame.set_rate(sample_rate.try_into()?);
+    frame.set_channels(num_channels.try_into()?);
+    frame.set_format(sample_format);
+
+    let mut encoded = ffmpeg::Packet::empty();
+    let mut pts = 0i64;
+
+    // Main encoding loop
+    for chunk_start in (0..num_samples).step_by(frame_size) {
+        let chunk_size = std::cmp::min(frame_size, num_samples - chunk_start);
+        
+        if chunk_size == 0 {
+            break;
+        }
+
+        frame.set_pts(Some(pts));
+        frame.set_samples(chunk_size);  // Set number of samples (not samples * channels)
+
+        // Copy data to frame based on format
+        if sample_format.is_planar() {
+            // For planar, each channel is separate
+            for channel in 0..num_channels {
+                let frame_data = frame.plane_mut::<f32>(channel);
+                frame_data[..chunk_size].copy_from_slice(
+                    &array.slice(s![chunk_start..chunk_start + chunk_size, channel])
+                        .to_owned()
+                        .as_slice()
+                        .unwrap()
+                );
+            }
+        } else {
+            // For interleaved, samples are packed together
+            let frame_data = frame.plane_mut::<f32>(0);
+            for i in 0..chunk_size {
+                for channel in 0..num_channels {
+                    frame_data[i * num_channels + channel] = array[[chunk_start + i, channel]];
+                }
+            }
+        }
+
+        encoder.send_frame(&frame).map_err(AudioError::from)?;
+        pts += chunk_size as i64;  // Increment by samples, not samples * channels
+
+        // Receive and write packets
+        receive_and_process_packets(&mut encoder, &mut encoded, &mut output, 0, in_time_base, out_time_base)?;
+    }
+
+    // Flush the encoder
+    encoder.send_eof().map_err(AudioError::from)?;
+    receive_and_process_packets(&mut encoder, &mut encoded, &mut output, 0, in_time_base, out_time_base)?;
+
+    output.write_trailer().map_err(AudioError::from)?;
+    Ok(())
+}
+
+// Helper function to handle packet receiving and writing
+fn receive_and_process_packets(
+    encoder: &mut ffmpeg::encoder::Audio,
+    packet: &mut ffmpeg::Packet,
+    output: &mut ffmpeg::format::context::Output,
+    stream_index: usize,
+    in_time_base: ffmpeg::Rational,
+    out_time_base: ffmpeg::Rational,
+) -> Result<(), AudioError> {
+    while encoder.receive_packet(packet).is_ok() {
+        packet.set_stream(stream_index);
+        packet.rescale_ts(in_time_base, out_time_base);
+        packet.write_interleaved(output)
+            .map_err(|e| AudioError::FFmpeg(e.to_string()))?;
+    }
+    Ok(())
 }
 
 #[pymodule]
 fn chunkloader(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(write, m)?)?;
     m.add_class::<AudioReader>()?;
     Ok(())
 }
